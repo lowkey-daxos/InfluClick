@@ -668,7 +668,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         };
 
         // ╔══ HEADER ════════════════════════════════════════════╗
-        // Title left, animated status pill right — no emojis
+        // Title left, animated status pill right
         {
             float pulse = 0.55f + 0.45f*(float)std::sin(t * 1.4f);
             ImVec4 titleCol = clicking
