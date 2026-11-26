@@ -1,0 +1,32 @@
+# Build output
+build/
+out/
+cmake-build-*/
+/InfluClick.exe
+*.obj
+*.o
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Dependencies downloaded by build.bat
+third_party/
+tools/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+_deps/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Runtime log written next to the exe
+influclick_log.txt

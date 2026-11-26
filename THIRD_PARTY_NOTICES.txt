@@ -1,0 +1,65 @@
+InfluClick - Third-party notices
+================================
+
+InfluClick itself is licensed under the MIT License (see LICENSE).
+
+The compiled InfluClick.exe contains the following third-party software.
+Their licenses require that the notices below accompany binary
+distributions, so please keep this file together with the exe.
+
+
+1) Dear ImGui
+-------------
+https://github.com/ocornut/imgui
+Version 1.91.9 (downloaded at build time, not stored in this repository)
+
+The MIT License (MIT)
+
+Copyright (c) 2014-2025 Omar Cornut
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+2) ProggyClean font (ImGui's built-in default font)
+---------------------------------------------------
+Embedded in Dear ImGui and used as a fallback when no system font is found.
+
+Copyright (c) 2004, 2005 Tristan Grimmer
+Distributed under the MIT License (same terms as above).
+https://github.com/bluescan/proggyfonts
+
+
+3) Compiler runtime libraries (statically linked)
+-------------------------------------------------
+- MSVC build: Microsoft Visual C++ runtime (/MT), redistributable by the
+  terms of the Visual Studio license.
+- MinGW-w64 build: GCC runtime libraries (libstdc++, libgcc) under the
+  GNU GPL v3 with the GCC Runtime Library Exception, and the mingw-w64
+  runtime (permissive licenses). The exception allows distributing the
+  resulting executable under any license.
+
+
+Not distributed with InfluClick
+-------------------------------
+- Windows system fonts (Segoe UI, Calibri, Tahoma) are loaded at runtime
+  from the user's own Windows installation and are not bundled.
+- DirectX, Win32 API and Windows SDK headers/libraries are part of Windows /
+  the compiler toolchain and are not redistributed.
+- Compilers downloaded by build.bat (MinGW-w64 / winlibs) are only fetched
+  to the user's disk at build time and are not part of this repository.
