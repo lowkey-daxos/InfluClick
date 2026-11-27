@@ -1,7 +1,6 @@
-// ============================================================
-//  InfluClick — Ultra Fast AutoClicker
-//  C++20 | ImGui 1.91 | DirectX 11 | SendInput
-// ============================================================
+/*
+ * InfluClick - autoclicker for Windows 10/11
+ */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,7 +8,7 @@
 #define NOMINMAX
 #endif
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0A00   // Windows 10 target (runs on Win 10 and Win 11)
+#define _WIN32_WINNT 0x0A00
 #endif
 #include <windows.h>
 #include <mmsystem.h>
@@ -25,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
+#include <cwchar>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -35,29 +35,32 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "dwmapi.lib")
 
-// ════════════════════════════════════════════════════════════
-//  Shared state (lock-free atomics)
-// ════════════════════════════════════════════════════════════
 static std::atomic<bool> g_running    {true};
 static std::atomic<bool> g_clicking   {false};
 static std::atomic<int>  g_cps_target {100};
 static std::atomic<int>  g_actual_cps {0};
 static std::atomic<int>  g_hotkey     {VK_F6};
-static std::atomic<bool> g_capturing        {false}; // true while hotkey capture is active
-static std::atomic<bool> g_skip_next_hotkey {false}; // skip first press after hotkey reassign
-static std::atomic<bool> g_paused_by_hover  {false}; // true when cursor is over our window
-static std::atomic<int>  g_mouse_btn  {0};   // 0=left 1=right 2=middle
+static std::atomic<bool> g_capturing        {false};
+static std::atomic<bool> g_skip_next_hotkey {false};
+static std::atomic<bool> g_paused_by_hover  {false};
+static std::atomic<int>  g_mouse_btn  {0};
 static std::atomic<bool> g_jitter     {false};
 static std::atomic<int>  g_jitter_pct {10};
 
-// Global HWND so threads can check window position
 static HWND g_hwnd = nullptr;
 
-// UI scale = 1.10 (window +10 % in width and height) * system DPI scale
-static float g_ui = 1.10f;
-static inline float S(float v) { return v * g_ui; }
+// only touched from the ui thread, so no atomics needed here
+static UINT  g_dpi = 96;
+static float g_ui  = 1.10f;
+static bool  g_rebuild_ui = true;
 
-// Diagnostic log: influclick_log.txt next to the exe (helps debugging on other PCs)
+static inline float S(float v) { return v * g_ui; }
+static inline float UiScaleForDpi(UINT dpi) { return 1.10f * (float)dpi / 96.f; }
+
+static constexpr DWORD kWinStyle   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+static constexpr DWORD kWinExStyle = WS_EX_TOPMOST;
+
+// logs next to the exe, makes it way easier to debug when it breaks on someone else's pc
 static void Log(const char* fmt, ...)
 {
     wchar_t path[MAX_PATH] = {};
@@ -74,9 +77,6 @@ static void Log(const char* fmt, ...)
     fclose(f);
 }
 
-// ════════════════════════════════════════════════════════════
-//  Click thread — maximum speed
-// ════════════════════════════════════════════════════════════
 static void ClickerThread()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -84,19 +84,14 @@ static void ClickerThread()
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
 
-    // ── PRNG: xorshift64 — fast, good distribution ──────────
-    // Seeded from QPC so every run is different
     LARGE_INTEGER seed_qi; QueryPerformanceCounter(&seed_qi);
     unsigned long long xr = (unsigned long long)seed_qi.QuadPart ^ 0xDEADBEEFCAFEULL;
     auto rng64 = [&]() -> unsigned long long {
         xr ^= xr << 13; xr ^= xr >> 7; xr ^= xr << 17; return xr;
     };
-    // Uniform float [0, 1)
     auto rndf = [&]() -> double {
         return (double)(rng64() >> 11) * (1.0 / (double)(1ULL << 53));
     };
-    // Box-Muller: Gaussian with mean=0, stddev=1
-    // Returns values clustered around 0, rarely exceeding ±3
     bool   bm_has_spare = false;
     double bm_spare     = 0.0;
     auto gauss = [&]() -> double {
@@ -109,12 +104,10 @@ static void ClickerThread()
         return u * m;
     };
 
-    // ── Human rhythm model ───────────────────────────────────
-    // drift: slow sinusoidal rhythm variation (breathing / fatigue)
-    // Every ~3-8 seconds the rhythm shifts slightly
-    double drift_phase    = rndf() * 6.283;      // random start phase
-    double drift_speed    = 0.008 + rndf()*0.006; // how fast drift evolves
-    double drift_amp      = 0.012;                // ±1.2% slow drift
+    // slow sine wobble on top of the gaussian noise, pure random looks too "flat" over time
+    double drift_phase    = rndf() * 6.283;
+    double drift_speed    = 0.008 + rndf()*0.006;
+    double drift_amp      = 0.012;
     int    clicks_since_reset = 0;
 
     int  count     = 0;
@@ -130,7 +123,6 @@ static void ClickerThread()
             clicks_since_reset = 0;
             sec_start         = std::chrono::steady_clock::now();
             g_actual_cps.store(0, std::memory_order_relaxed);
-            // Reset drift on stop so each session feels fresh
             drift_phase = rndf() * 6.283;
             drift_speed = 0.008 + rndf()*0.006;
             continue;
@@ -140,29 +132,21 @@ static void ClickerThread()
         const bool jitter = g_jitter.load(std::memory_order_relaxed);
         const int  jpct   = g_jitter_pct.load(std::memory_order_relaxed);
 
-        double base_ms = 1000.0 / (double)target; // ideal interval in ms
+        double base_ms = 1000.0 / (double)target;
 
         if (jitter && jpct > 0)
         {
-            // ── 1. Gaussian inter-click jitter ───────────────
-            // stddev = jpct% of base interval, clamped to ±3σ
             double sigma = base_ms * (jpct / 100.0);
             double g     = gauss();
-            // Soft-clamp: values beyond ±2.5σ get compressed, not cut
+            // squash the far tails instead of hard clamping, a flat cutoff would be visible in the data
             if (g >  2.5) g =  2.5 + (g -  2.5) * 0.2;
             if (g < -2.5) g = -2.5 + (g + 2.5) * 0.2;
             double interval = base_ms + g * sigma;
 
-            // ── 2. Slow rhythm drift (fatigue / breathing) ───
-            // Sinusoidal, evolves each click — imperceptible per-click
-            // but creates a natural ebb-and-flow over seconds
             drift_phase += drift_speed;
             double drift  = std::sin(drift_phase) * drift_amp * base_ms;
             interval     += drift;
 
-            // ── 3. Rare hesitation spike ─────────────────────
-            // ~1 in 180 clicks: +15-45 ms pause (finger stumble)
-            // Only at lower CPS where a 30ms pause is plausible
             if (target <= 25 && (rng64() % 180) == 0)
                 interval += 15.0 + rndf() * 30.0;
 
@@ -173,19 +157,14 @@ static void ClickerThread()
         long long base_ticks = (long long)(base_ms * (double)freq.QuadPart / 1000.0);
         if (base_ticks < 1) base_ticks = 1;
 
-        // ── 4. Variable press duration ───────────────────────
-        // Humans hold the button for a short random time before release.
-        // Typical: 20-80 ms at low CPS, shorter at high CPS.
-        // At very high CPS (>100) we skip this to preserve timing.
         long long hold_ticks = 0;
         if (jitter && target <= 80)
         {
-            double max_hold_ms = std::min(base_ms * 0.35, 55.0); // max 35% of interval
+            double max_hold_ms = std::min(base_ms * 0.35, 55.0);
             double hold_ms     = 8.0 + rndf() * (max_hold_ms - 8.0);
             hold_ticks = (long long)(hold_ms * (double)freq.QuadPart / 1000.0);
         }
 
-        // ── Send mouse down ──────────────────────────────────
         DWORD dn, up;
         switch (g_mouse_btn.load(std::memory_order_relaxed))
         {
@@ -201,7 +180,6 @@ static void ClickerThread()
         QueryPerformanceCounter(&t0);
         SendInput(1, &inp_dn, sizeof(INPUT));
 
-        // Hold: spin-wait before releasing
         if (hold_ticks > 0)
         {
             const long long hold_end = t0.QuadPart + hold_ticks;
@@ -226,7 +204,8 @@ static void ClickerThread()
             sec_start = now_tp;
         }
 
-        // ── Spin-wait for next click ─────────────────────────
+        // Sleep() only has ~1ms resolution at best, which wrecks timing at 500+ cps.
+        // So we spin on QPC and only yield (Sleep(0)) while there's >0.5ms left.
         const long long target_tick = t0.QuadPart + base_ticks;
         LARGE_INTEGER tnow;
         do {
@@ -237,9 +216,8 @@ static void ClickerThread()
     }
 }
 
-// ════════════════════════════════════════════════════════════
-//  Hotkey thread
-// ════════════════════════════════════════════════════════════
+// polling GetAsyncKeyState instead of RegisterHotKey so any key works
+// and we don't have to re-register every time the user rebinds
 static void HotkeyThread()
 {
     while (g_running.load(std::memory_order_relaxed))
@@ -248,8 +226,7 @@ static void HotkeyThread()
 
         const int key = g_hotkey.load(std::memory_order_relaxed);
 
-        // After a hotkey reassign the user still has the key held — wait for release
-        // before we start monitoring, so the assign itself never triggers a toggle.
+        // the key used for rebinding is still held for a moment, without this it would toggle instantly
         if (g_skip_next_hotkey.load(std::memory_order_relaxed))
         {
             if (GetAsyncKeyState(key) & 0x8000) { Sleep(5); continue; }
@@ -270,9 +247,6 @@ static void HotkeyThread()
     }
 }
 
-// ════════════════════════════════════════════════════════════
-//  DirectX 11
-// ════════════════════════════════════════════════════════════
 static ID3D11Device*           g_dev = nullptr;
 static ID3D11DeviceContext*    g_ctx = nullptr;
 static IDXGISwapChain*         g_sc  = nullptr;
@@ -306,7 +280,7 @@ static bool InitDX11(HWND hwnd)
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         lvls, 3, D3D11_SDK_VERSION, &sd, &g_sc, &g_dev, &out, &g_ctx);
-    // Win 10 machines with old/missing GPU drivers: fall back to software (WARP)
+    // some vms and pcs with broken gpu drivers can't do hardware d3d11, WARP is slow but at least it starts
     if (FAILED(hr))
     {
         Log("Hardware D3D11 failed: 0x%08X -> trying WARP", (unsigned)hr);
@@ -327,9 +301,64 @@ static void ShutdownDX11()
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
 }
 
-// ════════════════════════════════════════════════════════════
-//  WndProc
-// ════════════════════════════════════════════════════════════
+// these dpi functions don't exist on older win10 builds, so we grab them at runtime
+// instead of linking them directly (otherwise the exe won't even start there)
+template <class F>
+static F User32Fn(const char* name)
+{
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    return u32 ? reinterpret_cast<F>(GetProcAddress(u32, name)) : nullptr;
+}
+
+static void EnableDpiAwareness()
+{
+    using SetCtxFn = BOOL (WINAPI*)(HANDLE);
+    if (auto fn = User32Fn<SetCtxFn>("SetProcessDpiAwarenessContext"))
+    {
+        if (fn((HANDLE)-4)) return;
+        if (fn((HANDLE)-3)) return;
+    }
+    SetProcessDPIAware();
+}
+
+static UINT GetWindowDpi(HWND hwnd)
+{
+    if (hwnd)
+    {
+        using Fn = UINT (WINAPI*)(HWND);
+        if (auto fn = User32Fn<Fn>("GetDpiForWindow"))
+            if (UINT d = fn(hwnd)) return d;
+    }
+    using SysFn = UINT (WINAPI*)();
+    if (auto fn = User32Fn<SysFn>("GetDpiForSystem"))
+        if (UINT d = fn()) return d;
+
+    HDC dc = GetDC(nullptr);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(nullptr, dc);
+    return dpi > 0 ? (UINT)dpi : 96u;
+}
+
+static SIZE CalcOuterSize()
+{
+    RECT rc = {0, 0, (LONG)std::lround(420.f * g_ui), (LONG)std::lround(468.f * g_ui)};
+    using AdjFn = BOOL (WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    if (auto adj = User32Fn<AdjFn>("AdjustWindowRectExForDpi"))
+        adj(&rc, kWinStyle, FALSE, kWinExStyle, g_dpi);
+    else
+        AdjustWindowRectEx(&rc, kWinStyle, FALSE, kWinExStyle);
+    return { rc.right - rc.left, rc.bottom - rc.top };
+}
+
+static void ApplyWindowSize(HWND hwnd, const RECT* newPos)
+{
+    SIZE sz = CalcOuterSize();
+    UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | (newPos ? 0 : SWP_NOMOVE);
+    SetWindowPos(hwnd, nullptr,
+                 newPos ? newPos->left : 0, newPos ? newPos->top : 0,
+                 sz.cx, sz.cy, flags);
+}
+
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND,UINT,WPARAM,LPARAM);
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -341,13 +370,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_dev && g_sc && wp != SIZE_MINIMIZED && LOWORD(lp) > 0 && HIWORD(lp) > 0)
         {
             DestroyRTV();
-            // flags must match the ones used at swap-chain creation
+            // flags must match what the swap chain was created with, otherwise this fails
             HRESULT hr = g_sc->ResizeBuffers(0, LOWORD(lp), HIWORD(lp), DXGI_FORMAT_UNKNOWN,
                                              DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
             if (FAILED(hr)) Log("ResizeBuffers failed: 0x%08X", (unsigned)hr);
             CreateRTV();
         }
         return 0;
+    case WM_DPICHANGED:
+    {
+        g_dpi = (UINT)HIWORD(wp);
+        g_ui  = UiScaleForDpi(g_dpi);
+        // can't touch the font atlas from inside WndProc (might be mid-frame), so just set a flag
+        g_rebuild_ui = true;
+        const RECT* sug = reinterpret_cast<const RECT*>(lp);
+        ApplyWindowSize(hwnd, sug);
+        Log("DPI changed: %u -> ui scale %.2f", g_dpi, g_ui);
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
         break;
@@ -358,12 +398,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ════════════════════════════════════════════════════════════
-//  Neon dark theme
-// ════════════════════════════════════════════════════════════
 static void ApplyNeonTheme()
 {
     ImGuiStyle& s = ImGui::GetStyle();
+    // reset first, ScaleAllSizes multiplies in place so it would stack up on every dpi change
+    s = ImGuiStyle();
+
     s.WindowRounding    = 0.f;
     s.ChildRounding     = 8.f;
     s.FrameRounding     = 7.f;
@@ -425,12 +465,48 @@ static void ApplyNeonTheme()
     c[ImGuiCol_TextDisabled]      = C{0.32f,0.40f,0.54f,1.f};
     c[ImGuiCol_NavHighlight]      = C{0.f,0.80f,0.90f,0.80f};
 
-    s.ScaleAllSizes(g_ui);   // paddings, rounding, grabs... scaled once
+    s.ScaleAllSizes(g_ui);
 }
 
-// ════════════════════════════════════════════════════════════
-//  Utilities
-// ════════════════════════════════════════════════════════════
+static void LoadFonts(ImGuiIO& io)
+{
+    io.Fonts->Clear();
+
+    wchar_t win[MAX_PATH] = {};
+    UINT n = GetWindowsDirectoryW(win, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) wcscpy_s(win, L"C:\\Windows");
+
+    const wchar_t* names[] = { L"segoeui.ttf", L"calibri.ttf", L"tahoma.ttf", L"arial.ttf" };
+    for (const wchar_t* name : names)
+    {
+        wchar_t full[MAX_PATH];
+        swprintf_s(full, L"%s\\Fonts\\%s", win, name);
+        if (GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES) continue;
+
+        char path[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_UTF8, 0, full, -1, path, (int)sizeof(path), nullptr, nullptr);
+        if (io.Fonts->AddFontFromFileTTF(path, 14.5f * g_ui))
+        {
+            Log("Font: %ls", name);
+            return;
+        }
+    }
+
+    Log("No system font found, using imgui default");
+    ImFontConfig fc; fc.SizePixels = 13.f * g_ui;
+    io.Fonts->AddFontDefault(&fc);
+}
+
+// only call this between frames, rebuilding the atlas after NewFrame crashes imgui
+static void RebuildUI()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    LoadFonts(io);
+    ApplyNeonTheme();
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+    Log("UI rebuilt, dpi %u, scale %.2f", g_dpi, g_ui);
+}
+
 static std::string VkName(int vk)
 {
     switch (vk) {
@@ -460,47 +536,19 @@ static std::string VkName(int vk)
     }
 }
 
-// ════════════════════════════════════════════════════════════
-//  CPS graph ring buffer
-// ════════════════════════════════════════════════════════════
 static constexpr int kHist = 96;
 static float g_hist[kHist] = {};
 static int   g_hist_i      = 0;
 
-// ════════════════════════════════════════════════════════════
-//  WinMain
-// ════════════════════════════════════════════════════════════
-static void EnableDpiAwareness()
-{
-    // Win 10 1607+: SetProcessDpiAwarenessContext; older builds: SetProcessDPIAware
-    HMODULE u32 = GetModuleHandleW(L"user32.dll");
-    using SetCtxFn = BOOL (WINAPI*)(HANDLE);
-    auto fn = u32 ? (SetCtxFn)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : nullptr;
-    if (fn) { fn((HANDLE)-2 /* SYSTEM_AWARE */); return; }
-    SetProcessDPIAware();
-}
-
-static float GetSystemDpiScale()
-{
-    HMODULE u32 = GetModuleHandleW(L"user32.dll");
-    using GetDpiFn = UINT (WINAPI*)();
-    auto fn = u32 ? (GetDpiFn)GetProcAddress(u32, "GetDpiForSystem") : nullptr;
-    if (fn) return fn() / 96.f;
-    HDC dc = GetDC(nullptr);
-    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
-    if (dc) ReleaseDC(nullptr, dc);
-    return dpi / 96.f;
-}
-
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
     EnableDpiAwareness();
-    g_ui = 1.10f * GetSystemDpiScale();
+    g_dpi = GetWindowDpi(nullptr);
+    g_ui  = UiScaleForDpi(g_dpi);
 
     timeBeginPeriod(1);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
-    // ── Window ──────────────────────────────────────────────
     WNDCLASSEXW wc    = {};
     wc.cbSize         = sizeof(wc);
     wc.style          = CS_CLASSDC;
@@ -512,27 +560,33 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.lpszClassName  = L"InfluClick";
     RegisterClassExW(&wc);
 
-    // Compact fixed size — fits all content with no scrolling
-    // 420x468 originally, now +10 % in both directions (x DPI scale)
-    const int CLIENT_W = (int)std::lround(420.f * g_ui);
-    const int CLIENT_H = (int)std::lround(468.f * g_ui);
-    RECT rc = {0, 0, CLIENT_W, CLIENT_H};
-    AdjustWindowRectEx(&rc, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX, FALSE, WS_EX_TOPMOST);
+    const SIZE outer = CalcOuterSize();
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST,                     // always on top
+        kWinExStyle,
         wc.lpszClassName,
         L"InfluClick",
-        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
+        kWinStyle,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        rc.right - rc.left, rc.bottom - rc.top,
+        outer.cx, outer.cy,
         nullptr, nullptr, hInst, nullptr);
 
-    // DWM dark title bar
+    // with CW_USEDEFAULT the window can land on a secondary monitor with a different dpi
     {
+        UINT wdpi = GetWindowDpi(hwnd);
+        if (wdpi != g_dpi)
+        {
+            g_dpi = wdpi;
+            g_ui  = UiScaleForDpi(g_dpi);
+            ApplyWindowSize(hwnd, nullptr);
+        }
+    }
+
+    {
+        // attribute 20 is the official one, 19 is the same thing on pre-20H1 builds
         BOOL dm = TRUE;
-        if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dm, sizeof(dm))))   // DWMWA_USE_IMMERSIVE_DARK_MODE
-            DwmSetWindowAttribute(hwnd, 19, &dm, sizeof(dm));           // older Win 10 builds
+        if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dm, sizeof(dm))))
+            DwmSetWindowAttribute(hwnd, 19, &dm, sizeof(dm));
     }
 
     if (!InitDX11(hwnd))
@@ -546,39 +600,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
-    g_hwnd = hwnd; // store for hover detection
+    g_hwnd = hwnd;
 
-    // ── ImGui ────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename   = nullptr;
 
-    {
-        const wchar_t* fonts[] = {
-            L"C:\\Windows\\Fonts\\segoeui.ttf",
-            L"C:\\Windows\\Fonts\\calibri.ttf",
-            L"C:\\Windows\\Fonts\\tahoma.ttf",
-            nullptr
-        };
-        bool loaded = false;
-        for (auto** p = fonts; *p && !loaded; ++p)
-            if (GetFileAttributesW(*p) != INVALID_FILE_ATTRIBUTES)
-            {
-                char path[MAX_PATH];
-                WideCharToMultiByte(CP_UTF8,0,*p,-1,path,MAX_PATH,nullptr,nullptr);
-                io.Fonts->AddFontFromFileTTF(path, 14.5f * g_ui);
-                loaded = true;
-            }
-        if (!loaded)
-        {
-            ImFontConfig fc; fc.SizePixels = 13.f * g_ui;
-            io.Fonts->AddFontDefault(&fc);
-        }
-    }
-
-    ApplyNeonTheme();
     ImGui_ImplWin32_Init(hwnd);
     if (!ImGui_ImplDX11_Init(g_dev, g_ctx))
     {
@@ -592,25 +621,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         timeEndPeriod(1);
         return 1;
     }
-    Log("ImGui init OK, ui scale %.2f", g_ui);
+    Log("ImGui init OK, dpi %u, ui scale %.2f", g_dpi, g_ui);
     if (!g_rtv) Log("WARNING: render target view is null");
 
-    // ── Threads ──────────────────────────────────────────────
     std::thread t_click(ClickerThread);
     std::thread t_hotkey(HotkeyThread);
 
-    // ── UI state ─────────────────────────────────────────────
     int  ui_cps    = 100;
     int  ui_mbtn   = 0;
     bool ui_jitter = true;
     int  ui_jpct   = 5;
     bool wait_key       = false;
-    int  wait_key_frames = 0;  // frames to wait before scanning
+    int  wait_key_frames = 0;
 
     auto last_hist = std::chrono::steady_clock::now();
     const float CLR[4] = {0.035f, 0.035f, 0.060f, 1.f};
 
-    // ── Main loop ────────────────────────────────────────────
     MSG  msg  = {};
     bool done = false;
     while (!done)
@@ -623,6 +649,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         }
         if (done) break;
 
+        if (g_rebuild_ui)
+        {
+            RebuildUI();
+            g_rebuild_ui = false;
+        }
+
         auto now_tp = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 now_tp - last_hist).count() >= 250)
@@ -632,7 +664,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             last_hist = now_tp;
         }
 
-        // ── Hover pause: pause clicking while cursor is over our window ──
+        // without this the clicker would hammer our own buttons whenever you move the mouse over the window
         {
             POINT pt; GetCursorPos(&pt);
             HWND hovered = WindowFromPoint(pt);
@@ -660,25 +692,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         const float PAD  = ImGui::GetStyle().WindowPadding.x;
         const float FULL = WW - PAD * 2.f;
         const float SP   = ImGui::GetStyle().ItemSpacing.x;
+        const float FPX  = ImGui::GetStyle().FramePadding.x;
 
-        // Helper: bright section label on its own line
         auto SectionHeader = [](const char* s) {
             ImGui::Spacing();
             ImGui::TextColored({0.55f, 0.70f, 0.88f, 1.f}, "%s", s);
         };
 
-        // ╔══ HEADER ════════════════════════════════════════════╗
-        // Title left, animated status pill right
         {
             float pulse = 0.55f + 0.45f*(float)std::sin(t * 1.4f);
             ImVec4 titleCol = clicking
                 ? ImVec4(0.f, pulse, pulse * 0.88f, 1.f)
                 : ImVec4(0.55f, 0.65f, 0.82f, 1.f);
-            // "InfluClick v2" — all on one line
             ImGui::TextColored(titleCol, "InfluClick v2");
 
-
-            // Status pill
             const char* statusText = (clicking && hover_pause) ? "PAUSED"
                                    : clicking                  ? "ACTIVE"
                                                                : "STOPPED";
@@ -687,10 +714,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
             float sp2 = 0.40f + 0.24f*(float)std::sin(t * 3.2f);
             ImVec4 pillBg = (clicking && hover_pause)
-                ? ImVec4(0.40f, 0.28f, 0.00f, 0.55f)                  // amber — paused
+                ? ImVec4(0.40f, 0.28f, 0.00f, 0.55f)
                 : clicking
-                ? ImVec4(0.f, sp2*0.55f, sp2*0.48f, 0.36f)            // green — active
-                : ImVec4(0.09f, 0.09f, 0.16f, 1.f);                   // dim — stopped
+                ? ImVec4(0.f, sp2*0.55f, sp2*0.48f, 0.36f)
+                : ImVec4(0.09f, 0.09f, 0.16f, 1.f);
             ImVec4 pillFg = (clicking && hover_pause)
                 ? ImVec4(1.f, 0.80f, 0.20f, 1.f)
                 : clicking
@@ -712,8 +739,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui::Separator();
         ImGui::Spacing();
 
-        // ╔══ LIVE CPS + GRAPH ══════════════════════════════════╗
         {
+            // measure the real text instead of hardcoding, fallback fonts are wider and would overlap the graph
+            const float bigW  = ImGui::CalcTextSize("1000").x;
+            const float liveW = ImGui::CalcTextSize("CPS (live)").x;
+            const float tgtW  = ImGui::CalcTextSize("Target:  1000").x;
+            const float leftW = std::max({S(92.f), bigW, liveW, tgtW}) + SP * 1.5f;
+
             ImGui::BeginGroup();
             {
                 char num[16];
@@ -727,9 +759,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             }
             ImGui::EndGroup();
 
-            ImGui::SameLine(S(108.f), 0.f);
+            ImGui::SameLine(PAD + leftW, 0.f);
 
-            float gw = FULL - S(108.f) + PAD;
+            float gw = std::max(S(60.f), FULL - leftW);
             ImGui::PushStyleColor(ImGuiCol_FrameBg,   {0.04f,0.04f,0.08f,1.f});
             ImGui::PushStyleColor(ImGuiCol_PlotLines, {0.f,0.88f,1.f,1.f});
             float graph_max = (float)std::max(ui_cps, acps) * 1.25f;
@@ -742,26 +774,25 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui::Spacing();
         ImGui::Separator();
 
-        // ╔══ SPEED ════════════════════════════════════════════╗
         SectionHeader("Speed (CPS)");
 
-        // Slider + numeric input on same row
+        const float inW = std::max(S(74.f), ImGui::CalcTextSize("1000").x + FPX * 2.f + S(12.f));
+
         ImGui::PushStyleColor(ImGuiCol_SliderGrab,       {0.f,0.80f,0.92f,1.f});
         ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, {0.f,1.00f,1.00f,1.f});
-        ImGui::SetNextItemWidth(FULL - S(74.f) - SP);
+        ImGui::SetNextItemWidth(FULL - inW - SP);
         if (ImGui::SliderInt("##spd", &ui_cps, 1, 1000))
             g_cps_target.store(ui_cps, std::memory_order_relaxed);
         ImGui::PopStyleColor(2);
 
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(S(74.f));
+        ImGui::SetNextItemWidth(inW);
         if (ImGui::InputInt("##si", &ui_cps, 0, 0))
         {
             ui_cps = std::clamp(ui_cps, 1, 1000);
             g_cps_target.store(ui_cps, std::memory_order_relaxed);
         }
 
-        // Presets — full width, no label
         {
             constexpr int kPS[] = {10, 50, 100, 250, 500, 1000};
             float bw = (FULL - 5.f*SP) / 6.f;
@@ -780,7 +811,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui::Dummy({0.f, S(5.f)});
         ImGui::Separator();
 
-        // ╔══ MOUSE BUTTON ═════════════════════════════════════╗
         SectionHeader("Mouse Button");
         {
             const char* mbtn[] = {" Left ", " Right "};
@@ -798,7 +828,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui::Spacing();
         ImGui::Separator();
 
-        // ╔══ JITTER ════════════════════════════════════════════╗
         SectionHeader("Jitter");
         ImGui::SameLine();
         if (ImGui::Checkbox("##jit", &ui_jitter))
@@ -806,8 +835,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
         if (ui_jitter)
         {
+            const float jlW = ImGui::CalcTextSize("+/-50%").x;
             ImGui::SameLine();
-            ImGui::SetNextItemWidth(FULL - ImGui::GetCursorPosX() + PAD - S(42.f));
+            const float avail = WW - PAD - ImGui::GetCursorPosX();
+            ImGui::SetNextItemWidth(std::max(S(40.f), avail - SP - jlW));
             ImGui::PushStyleColor(ImGuiCol_SliderGrab, {0.f,0.80f,0.92f,1.f});
             if (ImGui::SliderInt("##jp", &ui_jpct, 1, 50))
                 g_jitter_pct.store(ui_jpct, std::memory_order_relaxed);
@@ -820,7 +851,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui::Spacing();
         ImGui::Separator();
 
-        // ╔══ HOTKEY ════════════════════════════════════════════╗
         SectionHeader("Hotkey");
         ImGui::SameLine();
         if (wait_key)
@@ -828,21 +858,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             float blink = (float)std::fmod(t, 1.0) > 0.5f ? 1.f : 0.55f;
             ImGui::TextColored({1.f, 0.75f*blink, 0.f, 1.f}, "[ Press any key... ]");
 
-            // Wait a few frames so the click that opened capture mode
-            // has been fully released before we start scanning
             if (wait_key_frames > 0)
             {
                 --wait_key_frames;
             }
             else
             {
-                // Only detect a key on RISING edge (just pressed, not held)
-                // by checking it wasn't down last frame
                 for (int vk = 8; vk < 256; ++vk)
                 {
                     if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
                     SHORT state = GetAsyncKeyState(vk);
-                    // bit 15 = currently down, bit 0 = pressed since last call
+                    // 0x8000 = held right now, 0x0001 = was pressed since the last call
                     if ((state & 0x8001) == 0x8001)
                     {
                         if (vk != VK_ESCAPE)
@@ -850,7 +876,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                         wait_key       = false;
                         wait_key_frames = 0;
                         g_capturing.store(false, std::memory_order_relaxed);
-                        g_skip_next_hotkey.store(true, std::memory_order_relaxed); // prevent this keypress from triggering a toggle
+                        g_skip_next_hotkey.store(true, std::memory_order_relaxed);
                         break;
                     }
                 }
@@ -866,7 +892,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::SameLine();
             ImGui::TextColored({0.28f,0.36f,0.50f,1.f}, "click to change");
 
-            // START / STOP button — right-aligned on same row
             const char* ssLbl = clicking ? " STOP " : " START ";
             float ssW = ImGui::CalcTextSize(ssLbl).x + S(20.f);
             ImGui::SameLine(WW - PAD - ssW);
@@ -887,7 +912,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             ImGui::PopStyleColor(3);
         }
 
-        // ╔══ FOOTER ════════════════════════════════════════════╗
         {
             float lineH = ImGui::GetTextLineHeight();
             float fh    = lineH + ImGui::GetStyle().FramePadding.y * 2.f + S(8.f);
@@ -911,13 +935,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 "Press  %s  to toggle   |   Target: %d CPS",
                 VkName(g_hotkey.load()).c_str(), ui_cps);
             float fw = ImGui::CalcTextSize(foot).x;
-            ImGui::SetCursorPosX((WW - fw) * 0.5f);
+            ImGui::SetCursorPosX(std::max(PAD, (WW - fw) * 0.5f));
             ImGui::TextColored({0.22f, 0.30f, 0.44f, 1.f}, "%s", foot);
         }
 
         ImGui::End();
 
-        // ── Render ───────────────────────────────────────────
         ImGui::Render();
         if (g_rtv)
         {
@@ -937,7 +960,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         }
     }
 
-    // ── Cleanup ──────────────────────────────────────────────
     g_running.store(false,  std::memory_order_relaxed);
     g_clicking.store(false, std::memory_order_relaxed);
     t_click.join();
