@@ -205,7 +205,7 @@ static void ClickerThread()
         }
 
         // Sleep() only has ~1ms resolution at best, which wrecks timing at 500+ cps.
-        // So we spin on QPC and only yield (Sleep(0)) while there's >0.5ms left.
+        // So this spins on QPC and only yields (Sleep(0)) while there's >0.5ms left.
         const long long target_tick = t0.QuadPart + base_ticks;
         LARGE_INTEGER tnow;
         do {
@@ -217,7 +217,7 @@ static void ClickerThread()
 }
 
 // polling GetAsyncKeyState instead of RegisterHotKey so any key works
-// and we don't have to re-register every time the user rebinds
+// and no need to re-register every time the user rebinds
 static void HotkeyThread()
 {
     while (g_running.load(std::memory_order_relaxed))
@@ -301,7 +301,7 @@ static void ShutdownDX11()
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
 }
 
-// these dpi functions don't exist on older win10 builds, so we grab them at runtime
+// these dpi functions don't exist on older win10 builds, so they get loaded at runtime
 // instead of linking them directly (otherwise the exe won't even start there)
 template <class F>
 static F User32Fn(const char* name)
@@ -664,7 +664,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             last_hist = now_tp;
         }
 
-        // without this the clicker would hammer our own buttons whenever you move the mouse over the window
+        // without this the clicker would hammer its own buttons whenever you move the mouse over the window
         {
             POINT pt; GetCursorPos(&pt);
             HWND hovered = WindowFromPoint(pt);
