@@ -1,6 +1,6 @@
 # InfluClick
 
-Ultra `fast` auto clicker for Windows 10/11. (C++20, Dear ImGui, DirectX 11, `SendInput`).
+Ultra `fast auto clicker` for Windows 10/11. (C++20, Dear ImGui, DirectX 11, `SendInput`).
 
 ![InfluClick](docs/screenshot.png)
 
